@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """校验 pktloss 的 CSV 末行快照是否等于预期。
 
-用法: check_csv.py <csv> <chan>:<recv>,<lost>,<gaps>,<maxgap>,<restarts>,<dup>,<bad> ...
+用法: check_csv.py <csv> <chan>:<recv>,<lost>,<gaps>,<maxgap>,<rounds>,<dup>,<abn>,<bad> ...
 """
 
 import sys
@@ -25,7 +25,8 @@ def main():
                 continue
             chan = int(parts[idx["chan"]])
             last[chan] = [int(parts[idx[k]]) for k in
-                          ("recv", "lost", "gaps", "maxgap", "rounds", "dup", "bad")]
+                          ("recv", "lost", "gaps", "maxgap", "rounds", "dup",
+                           "abn", "bad")]
 
     bad = 0
     for chan, want in expect.items():

@@ -19,10 +19,15 @@
  *   seq == expected                 → 正常
  *   seq >  expected                 → 丢 seq-expected 个，累加 lost
  *   seq == last_seq                 → 重复包，计 dup，不计丢包
- *   seq <  expected 且 != last_seq  → 编号回退 = 新一轮数据流（StreamStart 清零
- *                                     是最常见的形式）。该通道的统计整体清零：
- *                                     recv/lost/gaps/maxgap/dup/bad 全归零，
- *                                     rounds 累计 +1，这一包作为新一轮的首包。
+ *   seq <  expected 且 != last_seq 且 seq == 0
+ *                                   → 新一轮数据流（StreamStart 清零）。该通道
+ *                                     的本轮统计整体清零：recv/lost/gaps/maxgap/
+ *                                     dup/bad 全归零，rounds 累计 +1，这一包作为
+ *                                     新一轮的首包。
+ *   seq <  expected 且 != last_seq 且 seq != 0
+ *                                   → 非零回退 = FPGA 数据面故障（计数器错乱 /
+ *                                     串扰 / 乱序发帧）。abn +1、打印现场、立即
+ *                                     停机，走正常关闭流程后以 EXIT_FAILURE 退出。
  *   丢包率取**上界** (1 + lost) / recv（同 capture 的估算），只针对当前这一轮。
  *
  * 归因：帧编号跳跃有两种来源——链路/发送端真丢，或主机侧网卡/mbuf 不足丢包。
@@ -93,7 +98,7 @@
 
 /* ------------------------------------------------------------------ 统计 */
 
-enum verdict { V_FIRST, V_OK, V_GAP, V_DUP, V_RESTART };
+enum verdict { V_FIRST, V_OK, V_GAP, V_DUP, V_RESTART, V_ROLLBACK };
 
 /* 每通道状态。worker 写、主线程读，所以字段用 atomic（relaxed 即可：
  * 单写者、只需要避免撕裂，不需要跨字段顺序）。 */
@@ -102,9 +107,10 @@ struct ch_track {
     _Atomic uint64_t lost;      /* 累计跳跃量（= 估计丢包数） */
     _Atomic uint64_t gaps;      /* 跳跃事件次数 */
     _Atomic uint64_t maxgap;    /* 单次最大跳跃 */
-    _Atomic uint64_t rounds;    /* 轮次：编号回退/归零的次数，累计不清零 */
+    _Atomic uint64_t rounds;    /* 轮次：编号回退到 0 的次数，累计不清零 */
     _Atomic uint64_t dup;       /* 重复包 */
     _Atomic uint64_t bad;       /* 头不符（magic/长度） */
+    _Atomic uint64_t abn;       /* 非零回退次数：命中即停机，所以只可能是 0/1 */
     _Atomic uint64_t first_seq;
     _Atomic uint64_t last_seq;
     _Atomic uint64_t expected;  /* 下一个期望编号 */
@@ -130,16 +136,6 @@ static FILE    *g_raw_fp;  /* --raw-file：时域降采样输出 */
 static int      g_raw_no_seq; /* --raw-no-seq：只写 8192 B 采样，不含 8 B 包序号 */
 static int      g_rt_prio     = 0;  /* --sched-fifo N：worker 用 SCHED_FIFO，0 = 不设 */
 
-/* 丢包事件记录：发生时刻 + 编号 + 跳跃量。CPU 抢占造成的集中丢包会表现为
- * "某个时刻一次大 gap"，和链路的随机单包丢失在时间分布上完全不同。 */
-#define GAP_EVT_MAX 16
-struct gap_evt {
-    uint64_t t_ns;
-    uint64_t seq;
-    uint64_t size;
-};
-static struct gap_evt g_gevt[MAX_CHAN][GAP_EVT_MAX];
-static _Atomic int     g_gevt_n[MAX_CHAN];
 static int      g_quiet       = 0;
 static int      g_drain_start = 1;  /* --no-drain 关掉：启动窗口排空会吃掉一次性流量 */
 static char     g_pci[64];              /* 空 = 取第一个可用端口 */
@@ -148,6 +144,12 @@ static char     g_csv_path[512];
 static _Atomic int      g_stop;
 static _Atomic uint64_t g_other;        /* 非目标端口 / 非 IPv4-UDP / 多段包 */
 static _Atomic int      g_warned_bad;
+/* 非零回退 = FPGA 数据面故障：记下现场后停机，主线程收尾并以 EXIT_FAILURE 退出。 */
+static _Atomic int      g_fatal;
+static _Atomic int      g_fatal_chan;
+static _Atomic uint64_t g_fatal_expect;
+static _Atomic uint64_t g_fatal_seq;
+static _Atomic uint64_t g_fatal_ns;
 static _Atomic int      g_dump_cnt;
 static uint16_t         g_port;           /* 主线程用：端口号 */
 static _Atomic int      g_rt_warned;      /* RT throttling 警告只打一次 */
@@ -164,7 +166,7 @@ static void stop_workers_at_exit(void)
 static _Atomic uint64_t g_first_pkt_ns;   /* 首个有效包的 CLOCK_MONOTONIC 时刻 */
 static _Atomic uint64_t g_last_pkt_ns;    /* 最近一个有效包的 CLOCK_MONOTONIC 时刻 */
 static _Atomic uint64_t g_last_reset_ns;  /* 最近一次编号归零的时刻（统计起点） */
-static _Atomic uint64_t g_t0_ns;           /* 主循环起点（worker 记录 gap 时刻用） */
+static _Atomic uint64_t g_t0_ns;           /* 主循环起点（worker 记时刻用） */
 
 /* 端口层计数器（每秒打增量，用来定位丢在哪一层）：
  *   phy_pkts    PHY 收到的包（链路层）
@@ -184,14 +186,11 @@ static FILE *g_csv;
 /* ------------------------------------------------------------------ 判定 */
 /* 纯逻辑，不依赖 DPDK：--selftest 直接调用。返回本次判定，gap_out 给出跳跃量。 */
 
-static enum verdict track_update(struct ch_track *t, uint64_t seq, uint64_t *gap_out)
+static enum verdict track_update(struct ch_track *t, uint64_t seq)
 {
     const uint64_t last    = atomic_load_explicit(&t->last_seq, memory_order_relaxed);
     const uint64_t expect  = atomic_load_explicit(&t->expected, memory_order_relaxed);
     const int      started = atomic_load_explicit(&t->started, memory_order_relaxed);
-
-    if (gap_out)
-        *gap_out = 0;
 
     if (!started) {
         atomic_store(&t->started, 1);
@@ -230,29 +229,38 @@ static enum verdict track_update(struct ch_track *t, uint64_t seq, uint64_t *gap
 
         atomic_store(&t->last_seq, seq);
         atomic_store(&t->expected, seq + 1);
-        if (gap_out)
-            *gap_out = gap;
         return V_GAP;
     }
 
-    /* seq < expect 且不是重复包 → 编号回退 = 新一轮数据流。StreamStart 会把
-     * pkt_cnt 清零，这是最常见的形式。
-     *
-     * 这里把该通道的统计清零，让 recv/lost/gaps/dup/bad 只反映"最近一轮"：
-     * 每次重新开流后，丢包率从这一轮重新算起，而不是跨轮把旧数据混进来。
-     * rounds 累计不清零，用来知道到底跑了几轮。 */
-    atomic_fetch_add(&t->rounds, 1);
-    atomic_store(&t->recv, 0);
-    atomic_store(&t->lost, 0);
-    atomic_store(&t->gaps, 0);
-    atomic_store(&t->maxgap, 0);
-    atomic_store(&t->dup, 0);
-    atomic_store(&t->bad, 0);
-    atomic_store(&t->first_seq, seq);
+    /* seq < expect 且不是重复包 → 编号回退。只认"回退到 0"是合法的新一轮：
+     * StreamStart 会把 pkt_cnt 清零，这是固件重启唯一会产生的形式。
+     * 其余回退都是数据源异常（UDP 乱序、通道串扰、计数器错乱），不能当成
+     * 新流 —— 那样一次异常会被静默吞掉，统计还假装重新开始了。 */
+    if (seq == 0) {
+        /* 合法重启：把本轮统计清零，让 recv/lost/gaps/dup/bad 只反映最近
+         * 一轮；rounds 累计不清零（轮次算全程）。 */
+        atomic_fetch_add(&t->rounds, 1);
+        atomic_store(&t->recv, 0);
+        atomic_store(&t->lost, 0);
+        atomic_store(&t->gaps, 0);
+        atomic_store(&t->maxgap, 0);
+        atomic_store(&t->dup, 0);
+        atomic_store(&t->bad, 0);
+        atomic_store(&t->first_seq, seq);
+        atomic_store(&t->last_seq, seq);
+        atomic_store(&t->expected, seq + 1);
+        atomic_store(&t->recv, 1);
+        return V_RESTART;
+    }
+
+    /* 非零回退 = FPGA 数据面故障。判定函数只记账（abn+1、对齐基线），保证
+     * --selftest 能单独驱动它；真正停机由 worker 置 g_fatal/g_stop，main 负责
+     * 打印现场并以 EXIT_FAILURE 退出。 */
+    atomic_fetch_add(&t->abn, 1);
+    atomic_fetch_add(&t->recv, 1);
     atomic_store(&t->last_seq, seq);
     atomic_store(&t->expected, seq + 1);
-    atomic_store(&t->recv, 1);
-    return V_RESTART;
+    return V_ROLLBACK;
 }
 
 /* ------------------------------------------------------------------ 解析 */
@@ -452,8 +460,9 @@ static int worker_main(void *arg)
                 continue;
             }
 
-            uint64_t gap = 0;
-            const enum verdict v = track_update(&chans[idx], pi.seq, &gap);
+            const uint64_t exp_before =
+                atomic_load_explicit(&chans[idx].expected, memory_order_relaxed);
+            const enum verdict v = track_update(&chans[idx], pi.seq);
 
             if (idx == g_raw_chan && g_raw_fp != NULL) {
                 /* payload 的前 32 B 是 MetaData，采样从 META_LEN 开始；
@@ -476,13 +485,25 @@ static int worker_main(void *arg)
                     fwrite(buf, (size_t)(8 + n * 4), 1, g_raw_fp);
             }
 
-            if (v == V_GAP) {                    /* 记下这次跳跃的时刻与大小 */
-                const int k = atomic_fetch_add(&g_gevt_n[idx], 1) & (GAP_EVT_MAX - 1);
+            /* 非零回退只可能来自 FPGA 侧（计数器错乱、通道串扰、板卡乱序发帧）：
+             * 从这一刻起这个通道的编号不再可信，继续收只会生产垃圾统计。
+             * 记下现场、置停机标志，由主线程走正常的关闭流程并以非 0 退出。 */
+            if (v == V_ROLLBACK) {
+                if (atomic_exchange_explicit(&g_fatal, 1, memory_order_relaxed) == 0) {
+                    const uint64_t rel = now_mono_ns() -
+                        atomic_load_explicit(&g_t0_ns, memory_order_relaxed);
 
-                g_gevt[idx][k].t_ns = now_mono_ns() -
-                                      atomic_load_explicit(&g_t0_ns, memory_order_relaxed);
-                g_gevt[idx][k].seq  = pi.seq;
-                g_gevt[idx][k].size = gap;
+                    atomic_store(&g_fatal_chan, g_chans[idx]);
+                    atomic_store(&g_fatal_expect, exp_before);
+                    atomic_store(&g_fatal_seq, pi.seq);
+                    atomic_store(&g_fatal_ns, rel);
+                    fprintf(stderr,
+                            "\n错误: 通道 %d 非零回退（期望 %" PRIu64 "，收到 %" PRIu64
+                            "，t=%.2f s）—— FPGA 数据面故障，停止接收。\n",
+                            g_chans[idx], exp_before, pi.seq, (double)rel * 1e-9);
+                }
+                atomic_store_explicit(&g_stop, 1, memory_order_relaxed);
+                continue;
             }
 
             if (v == V_RESTART)
@@ -508,7 +529,7 @@ static int worker_main(void *arg)
 /* ------------------------------------------------------------------ 打印 */
 
 struct ch_snap {
-    uint64_t recv, lost, gaps, maxgap, rounds, dup, bad;
+    uint64_t recv, lost, gaps, maxgap, rounds, dup, bad, abn;
     uint64_t first_seq, last_seq, expected;
     int      started;
 };
@@ -524,6 +545,7 @@ static void snap_read(int c, struct ch_snap *s)
     s->rounds   = atomic_load_explicit(&t->rounds, memory_order_relaxed);
     s->dup      = atomic_load_explicit(&t->dup, memory_order_relaxed);
     s->bad      = atomic_load_explicit(&t->bad, memory_order_relaxed);
+    s->abn      = atomic_load_explicit(&t->abn, memory_order_relaxed);
     s->first_seq = atomic_load_explicit(&t->first_seq, memory_order_relaxed);
     s->last_seq  = atomic_load_explicit(&t->last_seq, memory_order_relaxed);
     s->expected  = atomic_load_explicit(&t->expected, memory_order_relaxed);
@@ -575,13 +597,12 @@ static uint64_t mbuf_avail(void)
 
 static void print_header(void)
 {
-    printf("\n%7s %3s %10s %9s %9s %8s %7s %7s %12s %4s %4s %4s %5s\n",
+    printf("\n%7s %3s %10s %9s %9s %8s %7s %7s %12s %4s %4s %4s %4s %5s\n",
            "t(s)", "ch", "recv", "pps", "lost", "dlost", "gaps",
-           "maxgap", "rate_ub", "rnd", "dup", "bad", "free%");
+           "maxgap", "rate_ub", "rnd", "dup", "abn", "bad", "free%");
 }
 
 static struct ch_snap g_prev[MAX_CHAN];
-static int      g_gevt_seen[MAX_CHAN];   /* 实时告警用：上次已打印到哪 */
 static double         g_prev_t;
 
 /* 读一组端口计数器到 cur[]。print_port_tick 和启动基线快照共用。
@@ -683,55 +704,30 @@ static void print_tick(double t)
 
         if (!s.started) {
             if (!g_quiet)
-                printf("%7.2f %3d %10s %9s %9s %8s %7s %7s %12s %4s %4s %4s %5s\n",
+                printf("%7.2f %3d %10s %9s %9s %8s %7s %7s %12s %4s %4s %4s %4s %5s\n",
                        t, g_chans[c], "-", "-", "-", "-", "-", "-", "(无数据)",
-                       "-", "-", "-", "-");
+                       "-", "-", "-", "-", "-");
             g_prev[c] = s;
             continue;
         }
 
         printf("%7.2f %3d %10" PRIu64 " %9.2f %9" PRIu64 " %8" PRIu64 " %7" PRIu64
-               " %7" PRIu64 " %12.3e %4" PRIu64 " %4" PRIu64 " %4" PRIu64 " %5.1f\n",
+               " %7" PRIu64 " %12.3e %4" PRIu64 " %4" PRIu64 " %4" PRIu64
+               " %4" PRIu64 " %5.1f\n",
                t, g_chans[c], s.recv, pps, s.lost, dlost, s.gaps, s.maxgap,
-               rate_of(s.lost, s.recv), s.rounds, s.dup, s.bad,
+               rate_of(s.lost, s.recv), s.rounds, s.dup, s.abn, s.bad,
                (double)mb * 100.0 / (double)NB_MBUF);
 
         if (g_csv) {
             fprintf(g_csv, "%" PRId64 ",%.3f,%d,%" PRIu64 ",%.0f,%" PRIu64 ",%" PRIu64
-                    ",%" PRIu64 ",%.9e,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+                    ",%" PRIu64 ",%.9e,%" PRIu64 ",%" PRIu64 ",%" PRIu64
+                    ",%" PRIu64 ",%" PRIu64 "\n",
                     (int64_t)time(NULL), t, g_chans[c], s.recv, pps, s.lost, s.gaps,
-                    s.maxgap, rate_of(s.lost, s.recv), s.rounds, s.dup, s.bad, mb);
+                    s.maxgap, rate_of(s.lost, s.recv), s.rounds, s.dup, s.abn,
+                    s.bad, mb);
         }
 
         g_prev[c]  = s;
-    }
-
-    /* 新发生的跳跃按设计要立刻报到 stderr：突发丢包的时刻要和系统事件
-     * （dmesg、top、别的进程）对得上，只在汇总里打印会错过现场。
-     * 眼下逐条明细关着（见下），这里只推进 g_gevt_seen。 */
-    for (int c = 0; c < g_nchan; c++) {
-        const int n = atomic_load_explicit(&g_gevt_n[c], memory_order_relaxed);
-
-        if (n == g_gevt_seen[c])
-            continue;
-
-        /* 逐条 [gap] 明细当前关着：一次突发能刷几百行 stderr，把汇总行冲掉。
-         * gaps/maxgap 两列和 Ctrl-C 汇总照旧。要恢复现场明细，把下面整段
-         * （连同 cnt/show 两个变量）解注释。
-        const int cnt  = n - g_gevt_seen[c];
-        const int show = cnt < 4 ? cnt : 4;
-
-        for (int i = 0; i < show; i++) {
-            const int k = (g_gevt_seen[c] + i) & (GAP_EVT_MAX - 1);
-
-            fprintf(stderr, "[gap] t=%.3fs ch%d seq=%" PRIu64 " size=%" PRIu64 "\n",
-                    (double)g_gevt[c][k].t_ns * 1e-9, g_chans[c],
-                    g_gevt[c][k].seq, g_gevt[c][k].size);
-        }
-        if (cnt > show)
-            fprintf(stderr, "[gap] ... ch%d 另有 %d 次未显示\n", g_chans[c], cnt - show);
-        */
-        g_gevt_seen[c] = n;
     }
 
     print_port_tick();
@@ -851,13 +847,15 @@ out:
 
 static void print_summary(double elapsed, uint16_t port)
 {
-    uint64_t recv = 0, lost = 0, gaps = 0, maxgap = 0, rounds = 0, dup = 0, bad = 0;
+    uint64_t recv = 0, lost = 0, gaps = 0, maxgap = 0, rounds = 0, dup = 0;
+    uint64_t bad = 0, abn = 0;
     uint64_t first = 0, last = 0, ref_span = 0;
     int      any_started = 0, ref_chan = -1;
 
     printf("\n================= 汇总 =================\n");
-    printf("%-10s %12s %12s %8s %8s %12s %6s %6s %6s\n",
-           "ch", "recv", "lost", "gaps", "maxgap", "rate_ub", "rnd", "dup", "bad");
+    printf("%-10s %12s %12s %8s %8s %12s %6s %6s %6s %6s\n",
+           "ch", "recv", "lost", "gaps", "maxgap", "rate_ub", "rnd", "dup", "abn",
+           "bad");
     printf("---------------------------------------------------------------"
            "----------------------\n");
 
@@ -873,12 +871,12 @@ static void print_summary(double elapsed, uint16_t port)
             }
             any_started = 1;
             printf("%-10d %12" PRIu64 " %12" PRIu64 " %8" PRIu64 " %8" PRIu64
-                   " %12.3e %6" PRIu64 " %6" PRIu64 " %6" PRIu64 "\n",
+                   " %12.3e %6" PRIu64 " %6" PRIu64 " %6" PRIu64 " %6" PRIu64 "\n",
                    g_chans[c], s.recv, s.lost, s.gaps, s.maxgap,
-                   rate_of(s.lost, s.recv), s.rounds, s.dup, s.bad);
+                   rate_of(s.lost, s.recv), s.rounds, s.dup, s.abn, s.bad);
         } else {
-            printf("%-10d %12s %12s %8s %8s %12s %6s %6s %6s\n",
-                   g_chans[c], "-", "-", "-", "-", "(无数据)", "-", "-", "-");
+            printf("%-10d %12s %12s %8s %8s %12s %6s %6s %6s %6s\n",
+                   g_chans[c], "-", "-", "-", "-", "(无数据)", "-", "-", "-", "-");
         }
 
         recv += s.recv;
@@ -889,6 +887,7 @@ static void print_summary(double elapsed, uint16_t port)
         if (s.rounds > rounds)
             rounds = s.rounds;               /* 各通道轮次相同，取最大作参考 */
         dup      += s.dup;
+        abn      += s.abn;
         bad      += s.bad;
     }
 
@@ -910,8 +909,8 @@ static void print_summary(double elapsed, uint16_t port)
     printf("---------------------------------------------------------------"
            "----------------------\n");
     printf("%-10s %12" PRIu64 " %12" PRIu64 " %8" PRIu64 " %8" PRIu64
-           " %12.3e %6" PRIu64 " %6" PRIu64 " %6" PRIu64 "\n",
-           "合计", recv, lost, gaps, maxgap, rate_of(lost, recv), rounds, dup, bad);
+           " %12.3e %6" PRIu64 " %6" PRIu64 " %6" PRIu64 " %6" PRIu64 "\n",
+           "合计", recv, lost, gaps, maxgap, rate_of(lost, recv), rounds, dup, abn, bad);
 
     printf("\n运行时长        %.2f s（有效统计 %.2f s）\n", elapsed, active);
     if (start_t >= 0.0 && active < elapsed - 0.5) {
@@ -929,7 +928,10 @@ static void print_summary(double elapsed, uint16_t port)
            lost, (int)gaps, maxgap);
     printf("丢包率上界      %.3e  ((1+lost)/recv；lost=0 时即为 1/recv)\n",
            rate_of(lost, recv));
-    printf("轮次(归零)      %" PRIu64 " 次（每次编号归零，统计清零重新开始）\n", rounds);
+    printf("轮次(归零)      %" PRIu64 " 次（编号回退到 0，统计清零重新开始）\n", rounds);
+    if (abn > 0)
+        printf("致命故障        %" PRIu64 " 次非零回退（FPGA 数据面故障，已停机）；"
+               "上面的统计只覆盖故障前\n", abn);
     printf("重复包          %" PRIu64 " 个\n", dup);
     printf("坏头            %" PRIu64 " 个；非目标包 %" PRIu64 " 个\n", bad, other);
     printf("吞吐            %.2f Gbps，%.3f Mpps，%.1f%% 的名义速率"
@@ -955,47 +957,20 @@ static void print_summary(double elapsed, uint16_t port)
                ref_chan, first, last, last - first + 1);
         printf("                注: 每通道 pkt_cnt 独立计数，这里只列一个通道作参照\n");
     }
-    /* 时间线：链路随机误码是分散的单包丢；CPU 抢占/队列溢出是某一刻的集中丢。
-     * 看这里的时间分布就能区分，配合 port 行的 out_of_buffer 增量更直接。 */
-    int any_evt = 0;
-
-    for (int c = 0; c < g_nchan; c++)
-        if (atomic_load(&g_gevt_n[c]) > 0)
-            any_evt = 1;
-
-    if (any_evt) {
-        printf("\n丢包事件（每通道最近 5 次：时刻 / 编号 / 跳跃量）\n");
-        for (int c = 0; c < g_nchan; c++) {
-            const int n = atomic_load(&g_gevt_n[c]);
-
-            if (n == 0)
-                continue;
-
-            const int show = n < 5 ? n : 5;
-
-            printf("  ch%-2d", g_chans[c]);
-            for (int i = 0; i < show; i++) {
-                const int k = (n - show + i) & (GAP_EVT_MAX - 1);
-
-                printf("  %.3fs/%" PRIu64 "/g%" PRIu64,
-                       (double)g_gevt[c][k].t_ns * 1e-9,
-                       g_gevt[c][k].seq, g_gevt[c][k].size);
-            }
-            printf("\n");
-        }
-    }
-
     printf("\n");
 }
 
 /* 把"编号跳跃"与"主机侧丢包"对比，给出归因结论。 */
-static void print_verdict(uint16_t port, uint64_t lost)
+static void print_verdict(uint16_t port, uint64_t lost, uint64_t abn)
 {
     struct rte_eth_stats st;
     uint64_t host = 0;
 
     if (rte_eth_stats_get(port, &st) == 0)
         host = st.imissed + st.rx_nombuf;
+
+    if (abn > 0)
+        printf("  本次运行因非零回退（FPGA 故障）中止，下面的归因只覆盖故障前的统计。\n");
 
     printf("归因\n");
     printf("  帧编号跳跃总数（估计丢包）: %" PRIu64 "\n", lost);
@@ -1031,17 +1006,15 @@ static int g_fail;
 
 static void selftest_case(const char *name, const uint64_t *seqs, size_t n,
                           uint64_t want_recv, uint64_t want_lost, uint64_t want_gaps,
-                          uint64_t want_maxgap, uint64_t want_rounds, uint64_t want_dup)
+                          uint64_t want_maxgap, uint64_t want_rounds, uint64_t want_dup,
+                          uint64_t want_abn)
 {
     struct ch_track t;
 
     memset(&t, 0, sizeof(t));
 
-    for (size_t i = 0; i < n; i++) {
-        uint64_t gap;
-
-        (void)track_update(&t, seqs[i], &gap);
-    }
+    for (size_t i = 0; i < n; i++)
+        (void)track_update(&t, seqs[i]);
 
     const uint64_t recv     = atomic_load(&t.recv);
     const uint64_t lost     = atomic_load(&t.lost);
@@ -1049,12 +1022,14 @@ static void selftest_case(const char *name, const uint64_t *seqs, size_t n,
     const uint64_t maxgap   = atomic_load(&t.maxgap);
     const uint64_t rounds   = atomic_load(&t.rounds);
     const uint64_t dup      = atomic_load(&t.dup);
+    const uint64_t abn      = atomic_load(&t.abn);
 
-    printf("  %-34s recv=%-4" PRIu64 " lost=%-6" PRIu64 " gaps=%-3" PRIu64
-           " max=%-6" PRIu64 " rnd=%-2" PRIu64 " dup=%-2" PRIu64 " %s\n",
-           name, recv, lost, gaps, maxgap, rounds, dup,
+    printf("  %-30s recv=%-4" PRIu64 " lost=%-6" PRIu64 " gaps=%-3" PRIu64
+           " max=%-6" PRIu64 " rnd=%-2" PRIu64 " dup=%-2" PRIu64 " abn=%-2" PRIu64 " %s\n",
+           name, recv, lost, gaps, maxgap, rounds, dup, abn,
            (recv == want_recv && lost == want_lost && gaps == want_gaps &&
-            maxgap == want_maxgap && rounds == want_rounds && dup == want_dup)
+            maxgap == want_maxgap && rounds == want_rounds && dup == want_dup &&
+            abn == want_abn)
                ? "OK" : "MISMATCH");
 
     CHECK(recv == want_recv, "%s: recv %" PRIu64 " != %" PRIu64, name, recv, want_recv);
@@ -1064,6 +1039,7 @@ static void selftest_case(const char *name, const uint64_t *seqs, size_t n,
     CHECK(rounds == want_rounds, "%s: rounds %" PRIu64 " != %" PRIu64, name,
           rounds, want_rounds);
     CHECK(dup == want_dup, "%s: dup %" PRIu64 " != %" PRIu64, name, dup, want_dup);
+    CHECK(abn == want_abn, "%s: abn %" PRIu64 " != %" PRIu64, name, abn, want_abn);
 }
 
 static int run_selftest(void)
@@ -1074,15 +1050,19 @@ static int run_selftest(void)
     static const uint64_t s_mid2[]   = { 100, 101, 102, 103, 50, 51 };
     static const uint64_t s_multi[]  = { 0, 1, 0, 1, 0, 1 };
     static const uint64_t s_big[]    = { 0, 10000 };
+    static const uint64_t s_ooo[]    = { 0, 1, 2, 4, 3, 5 };
 
     printf("判定逻辑自检（不需要 DPDK 初始化）\n");
-    /*                                                    recv lost gaps max rnd dup */
-    selftest_case("正常+跳跃+重复", s_basic, 6, 5, 2, 1, 2, 0, 1);
-    selftest_case("归零清零（第一段 4 包丢失）", s_zero, 7, 3, 0, 0, 0, 1, 0);
-    selftest_case("中途接入（首包非 0）", s_mid, 4, 4, 0, 0, 0, 0, 0);
-    selftest_case("回退到非 0 也清零", s_mid2, 6, 2, 0, 0, 0, 1, 0);
-    selftest_case("连续两轮归零", s_multi, 6, 2, 0, 0, 0, 2, 0);
-    selftest_case("大跳跃", s_big, 2, 2, 9999, 1, 9999, 0, 0);
+    /*                                                recv lost gaps max rnd dup abn */
+    selftest_case("正常+跳跃+重复", s_basic, 6, 5, 2, 1, 2, 0, 1, 0);
+    selftest_case("回退到 0 才清零", s_zero, 7, 3, 0, 0, 0, 1, 0, 0);
+    selftest_case("中途接入（首包非 0）", s_mid, 4, 4, 0, 0, 0, 0, 0, 0);
+    selftest_case("非零回退：判为故障 abn=1", s_mid2, 6, 6, 0, 0, 0, 0, 0, 1);
+    selftest_case("连续两轮归零", s_multi, 6, 2, 0, 0, 0, 2, 0, 0);
+    selftest_case("大跳跃", s_big, 2, 2, 9999, 1, 9999, 0, 0, 0);
+    /* 乱序 4,3：3 被判成回退（abn=1）。纯逻辑会把序列走完（5 再记一次跳跃），
+     * 实际运行在 3 处就停机了，这段"污染统计"不会产出。 */
+    selftest_case("乱序：纯逻辑走完，实跑停机", s_ooo, 6, 6, 2, 2, 1, 0, 0, 1);
 
     printf("%s\n\n", g_fail == 0 ? "自检通过" : "自检失败");
     return g_fail == 0 ? 0 : 1;
@@ -1121,7 +1101,8 @@ static const char *USAGE =
     "  -h, --help            显示本帮助\n"
     "\n"
     "判据: seq==expected 正常 / seq>expected 丢 seq-expected 个 /\n"
-    "      seq==last 重复 / seq<expected 且 !=last → 流重启，重置基线\n"
+    "      seq==last 重复 / 回退到 seq==0 → 新一轮，统计清零（rnd++）/\n"
+    "      回退到非 0 → 数据源异常：告警一次、abn++，统计不清零\n"
     "丢包率: lost/(lost+recv)\n";
 
 /* 通道列表：支持 0-7 / 0,2,4,6 / 0,2-3。排序去重，重复直接报错（两个队列
@@ -1616,7 +1597,7 @@ int main(int argc, char **argv)
         } else {
             fprintf(g_csv,
                     "unix_time,elapsed_s,chan,recv,pps,lost,gaps,maxgap,"
-                    "rate_ub,rounds,dup,bad,mbuf_avail\n");
+                    "rate_ub,rounds,dup,abn,bad,mbuf_avail\n");
         }
     }
 
@@ -1674,16 +1655,31 @@ int main(int argc, char **argv)
     if (elapsed - g_prev_t > 0.05)      /* 避免和最后一次 tick 重复 */
         print_tick(elapsed);
 
+    const int fatal = atomic_load_explicit(&g_fatal, memory_order_relaxed);
+
+    if (fatal) {
+        printf("\n!!! FPGA 故障：通道 %d 非零回退（期望 %" PRIu64 "，收到 %" PRIu64
+               "，t=%.2f s）\n",
+               atomic_load(&g_fatal_chan), atomic_load(&g_fatal_expect),
+               atomic_load(&g_fatal_seq),
+               (double)atomic_load(&g_fatal_ns) * 1e-9);
+        printf("    不是 StreamStart 的归零重启。已停止接收，下面的汇总只覆盖故障前，"
+               "退出码 1。\n");
+    }
+
     print_summary(elapsed, port);
 
     uint64_t lost_total = 0;
+    uint64_t abn_total  = 0;
 
-    for (int c = 0; c < g_nchan; c++)
+    for (int c = 0; c < g_nchan; c++) {
         lost_total += atomic_load(&chans[c].lost);
+        abn_total  += atomic_load(&chans[c].abn);
+    }
 
     print_port_stats(port);
     printf("\n");
-    print_verdict(port, lost_total);
+    print_verdict(port, lost_total, abn_total);
 
     if (g_csv) {
         fclose(g_csv);
@@ -1700,5 +1696,5 @@ int main(int argc, char **argv)
     rte_eth_dev_stop(port);
     rte_eth_dev_close(port);
     rte_eal_cleanup();
-    return 0;
+    return fatal ? EXIT_FAILURE : 0;
 }

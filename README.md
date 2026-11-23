@@ -17,18 +17,28 @@ UDP 目的端口精确分流），主 lcore 只做统计和信号。DPDK 独占�
 | `seq == expected` | 正常 | `recv++` |
 | `seq > expected` | 丢 `seq-expected` 个 | `lost += gap`，`gaps++` |
 | `seq == last` | 重复包 | `dup++`（不改基线） |
-| `seq < expected` 且 `!= last` | **新一轮**（StreamStart 清零 / 中途接入的新流） | 该通道统计**全部清零**，`rounds++`，这一包作为新一轮首包 |
+| `seq < expected`、`!= last`、**`seq == 0`** | **新一轮**：StreamStart 把 `pkt_cnt` 清零，这是唯一合法的重启形式 | 该通道本轮统计**全部清零**，`rounds++`，这一包作为新一轮首包 |
+| `seq < expected`、`!= last`、**`seq != 0`** | **致命故障**：FPGA 数据面错乱（计数器错乱 / 通道串扰 / 乱序发帧） | 立即停止接收，打印现场（通道、期望编号、实收、时刻），走正常关闭流程后 **`exit(1)`**；汇总里 `abn=1` |
 
 丢包率取**上界** `(1 + lost) / recv`（与 `capture_pipeline.rs` / `pipeline.rs` 里
 `ratio < (1 + ndropped) / nreceived` 一致）：分子 +1 覆盖"序列末尾可能没被观测到的
 那一个"，分母用实收数而非期望总数。所以 `lost=0` 时结果是 `1/recv` 而不是 0 ——
-意思是"在这个样本量下，仍可能有 1 个丢包没被看见"。**只针对当前这一轮**。编号归零时该通道的
+意思是"在这个样本量下，仍可能有 1 个丢包没被看见"。**只针对当前这一轮**。编号回退到 0 时该通道的
 `recv/lost/gaps/maxgap/dup/bad` 全部清零，所以每次 StreamStop→StreamStart 之后
 汇总只反映新开的那一轮；`rounds` 累计不清零，用来看总共跑了几轮。
 吞吐分母也从最近一次归零算起，不会把清零前的数据混进来。
 
 **不假定起点是 0**：先起接收再 StreamStart（首包 0）、先开流再起接收（首包非 0）、
-接收中 Stop→Start（编号回退）三种情况都按上表处理。
+接收中 Stop→Start（回退到 0）三种情况都按上表处理。
+
+**非零回退直接停机，不警告、不清零、不跳过**：`pkt_cnt` 只在 StreamStart 时清零，
+所以"回退到 0"是固件重启唯一会产生的形式，其余回退只可能来自 FPGA 侧。从那一包
+开始该通道的编号不再可信，继续收只是在生产垃圾统计——所以 `pktloss` 立刻停止接收，
+打印现场，走正常关闭流程后以退出码 1 结束，由外层脚本/监控捕获。
+
+早先的两版实现都不对：第一版把任何回退当新流清零，等于把故障静默吞成"重启"；
+第二版告警后继续跑，污染数据照样进统计。**代价是**长稳测试里一次偶发乱序就会中止，
+需要外层自动重启；这是有意选择——宁可中断，也不让故障数据混进丢包率。
 
 线上格式已实测确认（2026-10-24，板卡 192.168.5.164，320 MSps）：
 
@@ -58,12 +68,13 @@ mlx5 走 bifurcated driver：**不需要** `dpdk-devbind.py` unbind，内核接�
 ```bash
 cd ~/src/syncdaq_dpdk
 make
-./pktloss --selftest            # 判定逻辑（5 个合成场景，不需要 DPDK）
+./pktloss --selftest            # 判定逻辑（7 个合成场景，不需要 DPDK）
 ./tests/run_pcap_test.sh       # 端到端：pcap PMD 回放真实 UDP 帧，不需要 root
 ```
 
-`run_pcap_test.sh` 验证：正常递增、跳跃 2、大跳跃 9999、重复、回退、坏 magic、
-中途接入（首包 100）、非目标端口排除、`--chans 0,2,4,6` 子集映射。全绿才动实机。
+`run_pcap_test.sh` 验证：正常递增、跳跃 2、大跳跃 9999、重复、回退到 0（合法重启）、
+坏 magic、中途接入（首包 100）、非目标端口排除、`--chans 0,2,4,6,7` 子集映射，
+以及**非零回退必须停机且退出码非 0**。全绿才动实机。
 
 ## 4 实机测量流程（顺序很重要）
 
@@ -127,8 +138,8 @@ BOARD=192.168.5.164 ./tools/send.sh ~/src/syncdaq/cmd/StreamStop.yaml
 每秒一块，每通道一行：
 
 ```
-  t(s)  ch       recv       pps      lost    dlost    gaps  maxgap    loss_rate  rst  dup  bad free%
-  1.00   0     156250    156250         0        0       0       0    0.000e+00    0    0    0  50.4
+   t(s)  ch       recv       pps      lost    dlost    gaps  maxgap      rate_ub  rnd  dup  abn  bad free%
+   1.00   0     156250    156250         0        0       0       0    1.000e-01    0    0    0    0  50.4
 ```
 
 | 列 | 含义 |
@@ -139,7 +150,8 @@ BOARD=192.168.5.164 ./tools/send.sh ~/src/syncdaq/cmd/StreamStop.yaml
 | `dlost` | 本区间新增丢包（定位突发） |
 | `gaps` / `maxgap` | 跳跃段数 / 单次最大跳跃 |
 | `rate_ub` | 丢包率上界 `(1+lost)/recv`；`lost=0` 时是 `1/recv` |
-| `rnd` / `dup` | 轮次（编号归零次数）/ 重复包 |
+| `rnd` / `dup` | 轮次（编号**回退到 0** 的次数）/ 重复包 |
+| `abn` | 非零回退次数。命中即停机，所以只会是 0 或 1；非 0 = 本次运行因 FPGA 故障中止 |
 | `bad` | 头部 magic 或长度不符 |
 | `free%` | mbuf 池剩余；接近 0 说明主机侧要丢了 |
 
@@ -174,9 +186,11 @@ sudo ./run.sh [选项]        # EAL 参数由 run.sh 拼；也可直接 sudo ./p
   -r, --sps HZ          采样率，用于吞吐百分比（默认 320e6）
   -i, --interval SEC    打印间隔（默认 1.0）
   -c, --csv PATH        追加 CSV（unix_time,elapsed,chan,recv,pps,lost,gaps,maxgap,
-                        rate_ub,rounds,dup,bad,mbuf_avail）
+                        rate_ub,rounds,dup,abn,bad,mbuf_avail）
   -s, --soft-steer      单队列 + 软件分流（调试/pcap 用；性能测试别开）
   -q, --quiet           不打印无数据的通道行
+      --no-drain        跳过启动窗口排空（pcap 回放等一次性流量必须开，
+                        否则待测帧会被当成 flow 生效前的残留全丢掉）
       --sched-fifo N    worker 用 SCHED_FIFO N（0 = 不设，防 CPU 抢占丢包）
       --dump N          打印前 N 个包的 mbuf 原始头部（排障用）
       --selftest        只跑判定逻辑自检
@@ -207,7 +221,8 @@ sudo ./run.sh [选项]        # EAL 参数由 run.sh 拼；也可直接 sudo ./p
    每核 155 kpps ≈ **26 ms 缓冲**：CPU 时间片轮转（几 ms 让出）填不满队列，
    只有**连续 >26 ms 的停顿**才会丢一批——RT 进程抢占、内核长路径、内存回收、
    SMI。判读方法：看每秒 port 行的 `out_of_buffer` 增量（>0 = 主机队列溢出），
-   再看汇总里的"丢包事件"时间线（集中在某个时刻 = 抢占；分散的单包 = 链路）。
+   再看表格的 `dlost` / `maxgap`（一次跳几千且与 `out_of_buffer` 同步 = 队列溢出；
+   分散的单包跳 = 链路误码）。
    **实测数据**（`chrt -f 60` 抢占 CPU 6 十秒）：
    - worker `SCHED_OTHER`：每秒丢 143,128 个包（`out_of_buffer` 同步上涨），
      `143k ≈ 0.92 s × 155 kpps`，因为 RT throttling 每秒只给非 RT 任务 50 ms；
@@ -242,7 +257,7 @@ sudo ./run.sh [选项]        # EAL 参数由 run.sh 拼；也可直接 sudo ./p
 | 板卡打包 | `pkt_cnt1` 增量、`fifo_full_cnt` | `Query.yaml` |
 | 链路 PHY | `rx_phy_packets`、`rx_crc_errors_phy`、`rx_symbol_err_phy`、`rx_pause_ctrl_phy` | `sudo ethtool -S eno1np0` |
 | 网卡队列 | `out_of_buffer`、`imissed` | pktloss 每秒 `port:` 行 |
-| 应用层 | `lost`、gap 时间线 | pktloss 汇总 |
+| 应用层 | `lost`、`gaps`/`maxgap`、`abn` | pktloss 表格与汇总 |
 
 判据：
 

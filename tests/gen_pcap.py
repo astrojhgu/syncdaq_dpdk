@@ -6,12 +6,16 @@
   data_type@12, pkt_cnt@16, tail_magic@24) + 8192 B 采样。
 
 覆盖的场景：
-  ch0  seq 0,1,2,5,6,6,3,4   —— 正常 / 跳跃 2 / 重复 / 回退（流重启）
+  ch0  seq 0,1,2,5,6,6       —— 正常 / 跳跃 2 / 重复
   ch0  一条 magic 错误的包     —— 坏头
   ch2  seq 100..109           —— 中途接入（首包非 0）
   ch4  seq 0, 10000           —— 大跳跃 9999
   ch6  seq 0,1                —— 干净
+  ch7  seq 0,1,2,0,1,2        —— 回退到 0：合法重启，该通道统计清零
   ch1  seq 0,1,2              —— 不在 --chans 里，应计入"非目标包"
+
+--fault 模式另生成一条最小流（只含 ch0 的 0,1,2,5,3），用非零回退验证
+"pktloss 立即停机并以非 0 退出"。
 """
 
 import socket
@@ -45,15 +49,23 @@ def build_frame(dport, seq, magic=HEAD_MAGIC, port_id=None, datatype=16):
 
 
 def main():
-    out_path = sys.argv[1] if len(sys.argv) > 1 else "/tmp/pktloss_test.pcap"
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    out_path = args[0] if args else "/tmp/pktloss_test.pcap"
 
     frames = []
-    frames += [(4000, s, HEAD_MAGIC) for s in (0, 1, 2, 5, 6, 6, 3, 4)]
-    frames += [(4000, 10, 0xDEADBEEF)]                      # 坏 magic
-    frames += [(4002, s, HEAD_MAGIC) for s in range(100, 110)]
-    frames += [(4004, 0, HEAD_MAGIC), (4004, 10000, HEAD_MAGIC)]
-    frames += [(4006, 0, HEAD_MAGIC), (4006, 1, HEAD_MAGIC)]
-    frames += [(4001, s, HEAD_MAGIC) for s in range(3)]      # 非目标端口
+
+    if "--fault" in flags:
+        # 5 → 3 是非零回退：不是归零重启，pktloss 应当立刻停机。
+        frames += [(4000, s, HEAD_MAGIC) for s in (0, 1, 2, 5, 3)]
+    else:
+        frames += [(4000, s, HEAD_MAGIC) for s in (0, 1, 2, 5, 6, 6)]
+        frames += [(4000, 10, 0xDEADBEEF)]                  # 坏 magic
+        frames += [(4002, s, HEAD_MAGIC) for s in range(100, 110)]
+        frames += [(4004, 0, HEAD_MAGIC), (4004, 10000, HEAD_MAGIC)]
+        frames += [(4006, 0, HEAD_MAGIC), (4006, 1, HEAD_MAGIC)]
+        frames += [(4007, s, HEAD_MAGIC) for s in (0, 1, 2, 0, 1, 2)]  # 归零重启
+        frames += [(4001, s, HEAD_MAGIC) for s in range(3)]  # 非目标端口
 
     # pcap: 小端 magic, v2.4, snaplen 65535, DLT_EN10MB
     buf = bytearray(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1))
