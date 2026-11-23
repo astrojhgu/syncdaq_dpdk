@@ -1,0 +1,13 @@
+# 构建产物
+/pktloss
+
+# 编辑器 / 手工备份
+*~
+*.bak_*
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 测试临时文件（pcap 回放产物落在 /tmp，不在仓库里）
+/tests/*.pcap

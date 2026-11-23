@@ -1,0 +1,6 @@
+- !MixerSet
+  msg_id: 0
+  nports: 8
+  freq: [0, 0, 0, 0, 0, 0, 0, 0]
+  phase: [0, 0, 0, 0, 0, 0, 0, 0]
+  sync: 0
