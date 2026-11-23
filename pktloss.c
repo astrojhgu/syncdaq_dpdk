@@ -141,6 +141,7 @@ struct gap_evt {
 static struct gap_evt g_gevt[MAX_CHAN][GAP_EVT_MAX];
 static _Atomic int     g_gevt_n[MAX_CHAN];
 static int      g_quiet       = 0;
+static int      g_drain_start = 1;  /* --no-drain 关掉：启动窗口排空会吃掉一次性流量 */
 static char     g_pci[64];              /* 空 = 取第一个可用端口 */
 static char     g_csv_path[512];
 
@@ -151,6 +152,15 @@ static _Atomic int      g_dump_cnt;
 static uint16_t         g_port;           /* 主线程用：端口号 */
 static _Atomic int      g_rt_warned;      /* RT throttling 警告只打一次 */
 static _Atomic int      g_rx_enabled;
+
+/* rte_exit() 走 exit()，而 worker 线程还在 g_stop/g_rx_enabled 上自旋；EAL 的
+ * 清理会等 lcore 停下，于是退出卡死（实测 9 个核满转、768 页大页不释放，只能
+ * kill -9）。atexit 是 LIFO，这个比 EAL 的清理后注册、先执行，先把 g_stop 置上，
+ * worker 就能自己退出来。 */
+static void stop_workers_at_exit(void)
+{
+    atomic_store_explicit(&g_stop, 1, memory_order_relaxed);
+}
 static _Atomic uint64_t g_first_pkt_ns;   /* 首个有效包的 CLOCK_MONOTONIC 时刻 */
 static _Atomic uint64_t g_last_pkt_ns;    /* 最近一个有效包的 CLOCK_MONOTONIC 时刻 */
 static _Atomic uint64_t g_last_reset_ns;  /* 最近一次编号归零的时刻（统计起点） */
@@ -574,35 +584,54 @@ static struct ch_snap g_prev[MAX_CHAN];
 static int      g_gevt_seen[MAX_CHAN];   /* 实时告警用：上次已打印到哪 */
 static double         g_prev_t;
 
-/* 端口层增量：一眼看出这一秒是 PHY 丢、队列丢、还是上层收全了。 */
-static void print_port_tick(void)
+/* 读一组端口计数器到 cur[]。print_port_tick 和启动基线快照共用。
+ * 返回 0 = 成功。 */
+static int read_port_counters(uint64_t cur[XS_N])
 {
-    if (g_xidx[XS_PHY_PKTS] < 0)
-        return;
-
-    uint64_t cur[XS_N] = { 0 };
     struct rte_eth_stats st;
+
+    if (g_xidx[XS_PHY_PKTS] < 0)
+        return -1;
 
     const int nall = rte_eth_xstats_get_names(g_port, NULL, 0);
     if (nall <= 0)
-        return;
+        return -1;
 
     struct rte_eth_xstat *all = calloc((size_t)nall, sizeof(*all));
     if (all == NULL)
-        return;
-    if (rte_eth_xstats_get(g_port, all, (unsigned)nall) == nall) {
-        for (int k = 0; k < XS_N; k++) {
-            if (g_xidx[k] >= 0 && g_xidx[k] < nall)
-                cur[k] = all[g_xidx[k]].value;
-        }
-    } else {
+        return -1;
+    if (rte_eth_xstats_get(g_port, all, (unsigned)nall) != nall) {
         free(all);
-        return;
+        return -1;
+    }
+    for (int k = 0; k < XS_N; k++) {
+        if (g_xidx[k] >= 0 && g_xidx[k] < nall)
+            cur[k] = all[g_xidx[k]].value;
     }
     free(all);
 
     if (rte_eth_stats_get(g_port, &st) == 0 && g_xidx[XS_IMISSED] < 0)
         cur[XS_IMISSED] = st.imissed;
+    return 0;
+}
+
+/* 启动窗口（dev_start → flow 生效）里队列溢出的计数留在硬件里，清不掉。
+ * 把增量基线定在 drain 之后，第一秒的 port 行才不把这批算成"本秒新增"。 */
+static void snapshot_port_baseline(void)
+{
+    uint64_t cur[XS_N] = { 0 };
+
+    if (read_port_counters(cur) == 0)
+        memcpy(g_xprev, cur, sizeof(g_xprev));
+}
+
+/* 端口层增量：一眼看出这一秒是 PHY 丢、队列丢、还是上层收全了。 */
+static void print_port_tick(void)
+{
+    uint64_t cur[XS_N] = { 0 };
+
+    if (read_port_counters(cur) != 0)
+        return;
 
     printf("        port: phy_rx=+%" PRIu64 " phy_discard=+%" PRIu64
            " out_of_buffer=+%" PRIu64 " imissed=+%" PRIu64 "\n",
@@ -677,14 +706,18 @@ static void print_tick(double t)
         g_prev[c]  = s;
     }
 
-    /* 新发生的跳跃立刻报到 stderr：突发丢包的时刻要和系统事件（dmesg、top、
-     * 别的进程）对得上，只在汇总里打印会错过现场。 */
+    /* 新发生的跳跃按设计要立刻报到 stderr：突发丢包的时刻要和系统事件
+     * （dmesg、top、别的进程）对得上，只在汇总里打印会错过现场。
+     * 眼下逐条明细关着（见下），这里只推进 g_gevt_seen。 */
     for (int c = 0; c < g_nchan; c++) {
         const int n = atomic_load_explicit(&g_gevt_n[c], memory_order_relaxed);
 
         if (n == g_gevt_seen[c])
             continue;
 
+        /* 逐条 [gap] 明细当前关着：一次突发能刷几百行 stderr，把汇总行冲掉。
+         * gaps/maxgap 两列和 Ctrl-C 汇总照旧。要恢复现场明细，把下面整段
+         * （连同 cnt/show 两个变量）解注释。
         const int cnt  = n - g_gevt_seen[c];
         const int show = cnt < 4 ? cnt : 4;
 
@@ -697,7 +730,7 @@ static void print_tick(double t)
         }
         if (cnt > show)
             fprintf(stderr, "[gap] ... ch%d 另有 %d 次未显示\n", g_chans[c], cnt - show);
-
+        */
         g_gevt_seen[c] = n;
     }
 
@@ -763,7 +796,8 @@ static void print_port_stats(uint16_t port)
     if (rte_eth_stats_get(port, &st) == 0) {
         printf("  端口计数  rx_packets=%" PRIu64 "  rx_bytes=%" PRIu64
                "  imissed=%" PRIu64 "  rx_nombuf=%" PRIu64 "  ierrors=%" PRIu64 "\n",
-               st.ipackets, st.ibytes, st.imissed, st.rx_nombuf, st.ierrors);
+               st.ipackets, st.ibytes, st.imissed - g_xprev[XS_IMISSED],
+               st.rx_nombuf, st.ierrors);
     } else {
         printf("  端口计数  读取失败\n");
     }
@@ -796,7 +830,16 @@ static void print_port_stats(uint16_t port)
         for (int i = 0; i < m && i < n; i++) {
             if (strstr(names[i].name, want[w]) == NULL)
                 continue;
-            printf("%s=%" PRIu64 "  ", names[i].name, vals[i].value);
+            /* 减去启动窗口（flow 生效前）的基线，否则这里显示的是开机以来的累计值 */
+            uint64_t v = vals[i].value;
+
+            if (strcmp(names[i].name, "rx_out_of_buffer") == 0)
+                v -= g_xprev[XS_OOB];
+            else if (strcmp(names[i].name, "rx_discards_phy") == 0)
+                v -= g_xprev[XS_PHY_DISCARD];
+            else if (strcmp(names[i].name, "rx_packets_phy") == 0)
+                v -= g_xprev[XS_PHY_PKTS];
+            printf("%s=%" PRIu64 "  ", names[i].name, v);
         }
     }
     printf("\n");
@@ -1066,6 +1109,8 @@ static const char *USAGE =
     "  -s, --soft-steer      单队列 + 软件按 dport 分流（网卡不支持 dport flow 或\n"
     "                        用 pcap PMD 自测时使用）\n"
     "  -q, --quiet           不打印无数据的通道行\n"
+    "      --no-drain        跳过启动窗口排空（pcap 回放这类一次性流量用，\n"
+    "                        否则 drain 会把回放数据当残留全丢掉）\n"
     "      --dump N          打印前 N 个包的 mbuf 原始头部（排障用）\n"
     "      --sched-fifo N    worker 用 SCHED_FIFO N（防 CPU 抢占造成的集中丢包）\n"
     "      --raw-ch N        记录通道 N 的时域降采样（找 PPS 脉冲用）\n"
@@ -1220,6 +1265,8 @@ static void parse_args(int argc, char **argv)
             g_soft_steer = 1;
         } else if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet")) {
             g_quiet = 1;
+        } else if (!strcmp(argv[i], "--no-drain")) {
+            g_drain_start = 0;
         } else if ((v = optval(argc, argv, &i, "--pci")) || (v = optval(argc, argv, &i, "-p"))) {
             snprintf(g_pci, sizeof(g_pci), "%s", v);
         } else if ((v = optval(argc, argv, &i, "--base-port")) ||
@@ -1445,6 +1492,9 @@ int main(int argc, char **argv)
                  "\nEAL 初始化失败。检查: 大页是否配置（sudo ./setup.sh）、"
                  "-l 指定的 lcore 是否存在、--allow 的 PCI 地址是否正确。\n");
 
+    /* 任何 rte_exit 路径下都先让 worker 停下，否则退出会卡住（见上面的注释） */
+    atexit(stop_workers_at_exit);
+
     if (dd >= 0)
         parse_args(argc - dd - 1, argv + dd + 1);
     else
@@ -1526,6 +1576,36 @@ int main(int argc, char **argv)
 
     init_xstat_idx(port);
 
+    /* 中途接入时，rte_eth_dev_start 到 flow 规则建好之间（实测 ~0.26 s）的包
+     * 走默认 RSS，队列/通道映射是乱的；worker 又被 g_rx_enabled 挡着，8192
+     * 深的队列会灌满溢出（实测第一秒 out_of_buffer +13 万）。放行 worker 之前
+     * 先排空队列，把这段窗口的残留丢掉：worker 看到的第一个包是 flow 生效之后
+     * 的包，编号连续，不会在 ch0 上记成一次几十 k 的假跳跃。
+     * 这批包确实丢了（启动窗口内本来就收不到），但不污染稳态丢包率。 */
+    /* --no-drain 时必须跳过：pcap PMD 在 dev_start 后一次性灌完再也没数据，
+     * 排空等于把待测的包全扔了。 */
+    if (g_drain_start) {
+        struct rte_mbuf *dbuf[BURST];
+        const uint16_t   nq  = g_soft_steer ? 1u : (uint16_t)g_nchan;
+        unsigned         drop = 0;
+
+        for (uint16_t q = 0; q < nq; q++) {
+            /* 上限防活锁：drain 速度远高于 156 kpps/队列，正常情况下一次就空 */
+            unsigned budget = RX_DESC * 4u;
+            uint16_t dn;
+
+            while (budget > 0 &&
+                   (dn = rte_eth_rx_burst(port, q, dbuf, BURST)) > 0) {
+                rte_pktmbuf_free_bulk(dbuf, dn);
+                drop   += dn;
+                budget -= dn;
+            }
+        }
+        if (drop > 0)
+            printf("启动窗口积压的 %u 个包（flow 生效前）已丢弃，"
+                   "统计从之后的第一个包开始\n", drop);
+    }
+
     atomic_store_explicit(&g_t0_ns, now_mono_ns(), memory_order_relaxed);
     atomic_store_explicit(&g_rx_enabled, 1, memory_order_release);
 
@@ -1552,6 +1632,9 @@ int main(int argc, char **argv)
 
     g_port   = port;
     g_prev_t = 0.0;
+
+    /* 启动窗口（flow 生效前）的溢出计数留在硬件里，基线从这里开始算增量 */
+    snapshot_port_baseline();
 
     double t_next = g_interval;
 
