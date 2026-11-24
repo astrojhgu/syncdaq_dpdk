@@ -52,7 +52,7 @@ done
 
 echo
 echo "当前中断分布（应全部落在 $TARGET）："
-grep mlx5 /proc/interrupts | head -10 | cut -c1-100
+grep -m 10 mlx5 /proc/interrupts | cut -c1-100
 
 echo
 echo "提示："

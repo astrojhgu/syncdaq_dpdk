@@ -18,6 +18,8 @@
 #
 # 环境变量：PCI（默认 0000:01:00.0）、LCORES（默认 0-8）、SOCKET_MEM（默认 1536 MB）、
 #           DPDK_LOG（默认 lib.eal:warning）、RT_PRIO（默认 0，0 = 不设 SCHED_FIFO）
+#           DEVARGS（追加到 -a 的 mlx5 devarg；对 DPDK 26.x 默认自动设 txq_mem_algn=0，
+#                   原因见下方。显式赋值则以此为准）
 #
 # 注意：DPDK 独占数据口，运行期间内核侧 eno1np0 / 10.100.11.1 收不到包；
 #       用户态 recv_perf 之类的对照工具在这段时间会数到 0，这是正常的。
@@ -31,6 +33,28 @@ SOCKET_MEM=${SOCKET_MEM:-1536}      # MB
 DPDK_LOG=${DPDK_LOG:-lib.eal:warning}
 
 [ -x "$BIN" ] || { echo "还没编译：make" >&2; exit 1; }
+
+# DPDK 26.x 的 mlx5 在 nb_tx_queues=0（纯接收）时也会调
+# mlx5_dev_allocate_consec_tx_mem()：total_size = 0，rte_zmalloc_socket(size=0)
+# 返回 NULL，dev_start 直接失败：
+#   mlx5_net: Failed to allocate consecutive memory for TxQs.
+#   mlx5_net: port 0 Tx queues memory allocation failed: Cannot allocate memory
+# pktloss 只收不发（rte_eth_dev_configure 传 nb_tx_queues=0），正好踩中这个 bug。
+# txq_mem_algn=0 关掉合并的 TxQ umem、回退 legacy 的每队列分配 (没有 TxQ 时是
+# no-op)。23.11 一类的老 DPDK 没有这条代码路径，还会把这个 key 当未知 devarg
+# 直接判错，所以只对 26.x 默认打开。判定依据是 $BIN 的 DT_RPATH 指向的那份
+# libdpdk.pc 版本，跟 sudo/环境变量无关。DEVARGS 显式给值时以用户为准。
+if [ -z "${DEVARGS+set}" ]; then
+    DEVARGS=
+    _dpdk_libdir=$(readelf -d "$BIN" 2>/dev/null |
+                   sed -n 's/.*(RPATH).*\[\(.*\)\]/\1/p' | head -1 || true)
+    _dpdk_ver=$(sed -n 's/^Version:[[:space:]]*//p' \
+                    "$_dpdk_libdir/pkgconfig/libdpdk.pc" 2>/dev/null | head -1 || true)
+    case "$_dpdk_ver" in
+        26.*|2[7-9].*|[3-9][0-9].*) DEVARGS=txq_mem_algn=0 ;;
+    esac
+    unset _dpdk_libdir _dpdk_ver
+fi
 
 free_hp=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages)
 need_hp=$((SOCKET_MEM / 2))
@@ -82,7 +106,7 @@ EOF
 
 RT_PRIO=${RT_PRIO:-0}           # worker 的 SCHED_FIFO 优先级；0 = 不设（默认）
                                 # 要用 RT 必须先关 sched_rt_runtime_us，否则会周期性丢包
-EAL_ARGS=(-l "$LCORES" -n 4 -a "$PCI"
+EAL_ARGS=(-l "$LCORES" -n 4 -a "$PCI${DEVARGS:+,$DEVARGS}"
           --socket-mem "$SOCKET_MEM"
           --file-prefix pktloss
           --huge-unlink
