@@ -597,8 +597,8 @@ static uint64_t mbuf_avail(void)
 
 static void print_header(void)
 {
-    printf("\n%7s %3s %10s %9s %9s %8s %7s %7s %12s %4s %4s %4s %4s %5s\n",
-           "t(s)", "ch", "recv", "pps", "lost", "dlost", "gaps",
+    printf("\n%7s %3s %10s %11s %9s %9s %8s %7s %7s %12s %4s %4s %4s %4s %5s\n",
+           "t(s)", "ch", "recv", "pkt_cnt", "pps", "lost", "dlost", "gaps",
            "maxgap", "rate_ub", "rnd", "dup", "abn", "bad", "free%");
 }
 
@@ -687,14 +687,35 @@ static void print_tick(double t)
             active = t - st;
     }
 
+    /* 一次读完所有通道，下面 banner 的最大值和各行都用同一份快照，不会互相矛盾。
+     * pkt_cnt 就是包头里的编号，worker 每包把它写进 last_seq，所以这里读到的
+     * 就是"打印时刻已知的最新值"，不需要 worker 付出任何额外代价；差几个包
+     * （正在 rx_burst 里还没处理的那批）无所谓。 */
+    struct ch_snap snaps[MAX_CHAN];
+    uint64_t       maxp     = 0;
+    int            any_seen = 0;
+
+    for (int c = 0; c < g_nchan; c++) {
+        snap_read(c, &snaps[c]);
+        if (snaps[c].started && snaps[c].last_seq > maxp)
+            maxp = snaps[c].last_seq;
+        any_seen |= snaps[c].started;
+    }
+
+    char maxbuf[24];
+
+    if (any_seen)
+        snprintf(maxbuf, sizeof(maxbuf), "%" PRIu64, maxp);
+    else
+        snprintf(maxbuf, sizeof(maxbuf), "-");
+
     printf("\n--- t = %7.2f s ---------------------------------------------------------"
-           "----------------  mbuf_avail=%" PRIu64 "\n", t, mb);
+           "----------------  mbuf_avail=%" PRIu64 "  max_pkt_cnt=%s\n", t, mb, maxbuf);
 
     print_header();     /* 每个 tick 都带列名：滚动日志里不用往上翻 */
 
     for (int c = 0; c < g_nchan; c++) {
-        struct ch_snap s;
-        snap_read(c, &s);
+        const struct ch_snap s = snaps[c];
 
         /* dlost 仍是区间增量（用来定位突发）；pps 用本轮累计平均 */
         const uint64_t dlost = s.lost >= g_prev[c].lost
@@ -704,27 +725,27 @@ static void print_tick(double t)
 
         if (!s.started) {
             if (!g_quiet)
-                printf("%7.2f %3d %10s %9s %9s %8s %7s %7s %12s %4s %4s %4s %4s %5s\n",
-                       t, g_chans[c], "-", "-", "-", "-", "-", "-", "(无数据)",
+                printf("%7.2f %3d %10s %11s %9s %9s %8s %7s %7s %12s %4s %4s %4s %4s %5s\n",
+                       t, g_chans[c], "-", "-", "-", "-", "-", "-", "-", "(无数据)",
                        "-", "-", "-", "-", "-");
             g_prev[c] = s;
             continue;
         }
 
-        printf("%7.2f %3d %10" PRIu64 " %9.2f %9" PRIu64 " %8" PRIu64 " %7" PRIu64
-               " %7" PRIu64 " %12.3e %4" PRIu64 " %4" PRIu64 " %4" PRIu64
-               " %4" PRIu64 " %5.1f\n",
-               t, g_chans[c], s.recv, pps, s.lost, dlost, s.gaps, s.maxgap,
-               rate_of(s.lost, s.recv), s.rounds, s.dup, s.abn, s.bad,
+        printf("%7.2f %3d %10" PRIu64 " %11" PRIu64 " %9.2f %9" PRIu64 " %8" PRIu64
+               " %7" PRIu64 " %7" PRIu64 " %12.3e %4" PRIu64 " %4" PRIu64
+               " %4" PRIu64 " %4" PRIu64 " %5.1f\n",
+               t, g_chans[c], s.recv, s.last_seq, pps, s.lost, dlost, s.gaps,
+               s.maxgap, rate_of(s.lost, s.recv), s.rounds, s.dup, s.abn, s.bad,
                (double)mb * 100.0 / (double)NB_MBUF);
 
         if (g_csv) {
-            fprintf(g_csv, "%" PRId64 ",%.3f,%d,%" PRIu64 ",%.0f,%" PRIu64 ",%" PRIu64
-                    ",%" PRIu64 ",%.9e,%" PRIu64 ",%" PRIu64 ",%" PRIu64
-                    ",%" PRIu64 ",%" PRIu64 "\n",
-                    (int64_t)time(NULL), t, g_chans[c], s.recv, pps, s.lost, s.gaps,
-                    s.maxgap, rate_of(s.lost, s.recv), s.rounds, s.dup, s.abn,
-                    s.bad, mb);
+            fprintf(g_csv, "%" PRId64 ",%.3f,%d,%" PRIu64 ",%" PRIu64 ",%.0f,%" PRIu64
+                    ",%" PRIu64 ",%" PRIu64 ",%.9e,%" PRIu64 ",%" PRIu64
+                    ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+                    (int64_t)time(NULL), t, g_chans[c], s.recv, s.last_seq, pps,
+                    s.lost, s.gaps, s.maxgap, rate_of(s.lost, s.recv), s.rounds,
+                    s.dup, s.abn, s.bad, mb);
         }
 
         g_prev[c]  = s;
@@ -1596,7 +1617,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "无法打开 CSV %s: %s\n", g_csv_path, strerror(errno));
         } else {
             fprintf(g_csv,
-                    "unix_time,elapsed_s,chan,recv,pps,lost,gaps,maxgap,"
+                    "unix_time,elapsed_s,chan,recv,pkt_cnt,pps,lost,gaps,maxgap,"
                     "rate_ub,rounds,dup,abn,bad,mbuf_avail\n");
         }
     }

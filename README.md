@@ -138,13 +138,17 @@ BOARD=192.168.5.164 ./tools/send.sh ~/src/syncdaq/cmd/StreamStop.yaml
 每秒一块，每通道一行：
 
 ```
-   t(s)  ch       recv       pps      lost    dlost    gaps  maxgap      rate_ub  rnd  dup  abn  bad free%
-   1.00   0     156250    156250         0        0       0       0    1.000e-01    0    0    0    0  50.4
+   t(s)  ch       recv     pkt_cnt       pps      lost    dlost    gaps  maxgap      rate_ub  rnd  dup  abn  bad free%
+   1.00   0     156250      156249    156250         0        0       0       0    1.000e-01    0    0    0    0  50.4
 ```
+
+每块的表头行前面还有一行 `--- t = ... mbuf_avail=... max_pkt_cnt=...`，
+`max_pkt_cnt` 是打印时刻**所有通道里最大的** `pkt_cnt`（还没收到包时是 `-`）。
 
 | 列 | 含义 |
 |---|---|
 | `recv` | 收到且头部合法的包 |
+| `pkt_cnt` | 本通道最新一包的帧编号（payload off 16 的 `u64`，StreamStart 清零）。取的是 worker 每包写下的 `last_seq`，主线程只在打印时读一遍，热路径零开销；可能比真实值差几个正在 `rx_burst` 里还没处理的包 |
 | `pps` | 本区间瞬时包率（理论 156 250/s/通道） |
 | `lost` | 累计跳跃量 = 估计丢包数 |
 | `dlost` | 本区间新增丢包（定位突发） |
@@ -185,8 +189,8 @@ sudo ./run.sh [选项]        # EAL 参数由 run.sh 拼；也可直接 sudo ./p
   -d, --duration SEC    运行秒数（0 = 直到 Ctrl-C）
   -r, --sps HZ          采样率，用于吞吐百分比（默认 320e6）
   -i, --interval SEC    打印间隔（默认 1.0）
-  -c, --csv PATH        追加 CSV（unix_time,elapsed,chan,recv,pps,lost,gaps,maxgap,
-                        rate_ub,rounds,dup,abn,bad,mbuf_avail）
+  -c, --csv PATH        追加 CSV（unix_time,elapsed,chan,recv,pkt_cnt,pps,lost,gaps,
+                        maxgap,rate_ub,rounds,dup,abn,bad,mbuf_avail）
   -s, --soft-steer      单队列 + 软件分流（调试/pcap 用；性能测试别开）
   -q, --quiet           不打印无数据的通道行
       --no-drain        跳过启动窗口排空（pcap 回放等一次性流量必须开，
